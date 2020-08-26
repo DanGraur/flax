@@ -26,7 +26,6 @@ try:
   import tpu_magic
 except ImportError:
   print("Did not configure TPU.")
-  sys.exit()
 
 FLAGS = flags.FLAGS
 

@@ -1,3 +1,5 @@
+import os
+
 import ml_collections
 
 
@@ -17,10 +19,19 @@ def get_config():
   config.depth = 50
 
   config.sync_steps = 100
-  config.checkpoint_period = 1_500
+  config.checkpoint_period = 500
+
+  # Inference post processing options
+  config.apply_filtering = True
+  config.per_level = False
+  config.per_class = True
+  config.level_detections = 100
+  config.max_detections = 100
+  config.confidence_threshold = 0.05
+  config.iou_threshold = 0.5
 
   # Evaluation parameters
-  config.eval_annotations_path = "/home/dgraur/data/files/coco_annotations/instances_val2014.json"
+  config.eval_annotations_path = os.environ['COCO_ANNOTATIONS_PATH']
   config.eval_remove_background = True
   config.eval_threshold = 0.05
 

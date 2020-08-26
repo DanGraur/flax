@@ -596,16 +596,22 @@ def get_coco_splits(rng):
 
 
 def train_preprocess_fn(features):
-  fn = DataPreprocessor(min_size=224, max_size=224, label_shift=1)(augment_image=True)
+  fn = DataPreprocessor(
+      min_size=600, max_size=600, label_shift=1)(
+          augment_image=True)
   return fn(features)
 
 
 def eval_preprocess_fn(features):
-  fn = DataPreprocessor(min_size=224, max_size=224, label_shift=1)(augment_image=False)
+  fn = DataPreprocessor(
+      min_size=600, max_size=600, label_shift=1)(
+          augment_image=False)
   return fn(features)
 
 
-def create_datasets(config: ml_collections.ConfigDict, rng) -> Tuple[tfds.core.DatasetInfo, tf.data.Dataset, tf.data.Dataset]:
+def create_datasets(
+    config: ml_collections.ConfigDict,
+    rng) -> Tuple[tfds.core.DatasetInfo, tf.data.Dataset, tf.data.Dataset]:
   """Create datasets for training and evaluation.
 
   Args:

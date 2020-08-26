@@ -1,6 +1,8 @@
 from jax import numpy as jnp
 
 import jax
+from multiprocessing import Pool
+from multiprocessing.pool import ThreadPool
 import numpy as np
 import tensorflow as tf
 
@@ -149,7 +151,8 @@ def non_max_suppression(bboxes, scores, t):
 
   Returns:
     The indexes of the bboxes which are retained after NMS is applied, as well
-    as their indexes in the original matrix.
+    as their indexes in the original matrix. Both are ordered in decreasing 
+    order.
   """
   selected_idx = []
 
@@ -159,7 +162,7 @@ def non_max_suppression(bboxes, scores, t):
   x2 = bboxes[:, 2]
   y2 = bboxes[:, 3]
 
-  sorted_idx = jnp.argsort(scores)
+  sorted_idx = np.argsort(scores)
   areas = (x2 - x1 + 1) * (y2 - y1 + 1)
 
   while sorted_idx.shape[0] > 0:
@@ -168,13 +171,13 @@ def non_max_suppression(bboxes, scores, t):
     selected_idx.append(current)
 
     # Determine the height and width of the intersections with the current bbox
-    xx1 = jnp.maximum(x1[current], x1[sorted_idx[:-1]])
-    yy1 = jnp.maximum(y1[current], y1[sorted_idx[:-1]])
-    xx2 = jnp.minimum(x2[current], x2[sorted_idx[:-1]])
-    yy2 = jnp.minimum(y2[current], y2[sorted_idx[:-1]])
+    xx1 = np.maximum(x1[current], x1[sorted_idx[:-1]])
+    yy1 = np.maximum(y1[current], y1[sorted_idx[:-1]])
+    xx2 = np.minimum(x2[current], x2[sorted_idx[:-1]])
+    yy2 = np.minimum(y2[current], y2[sorted_idx[:-1]])
 
-    width = jnp.maximum(0.0, xx2 - xx1 + 1)
-    height = jnp.maximum(0.0, yy2 - yy1 + 1)
+    width = np.maximum(0.0, xx2 - xx1 + 1)
+    height = np.maximum(0.0, yy2 - yy1 + 1)
 
     # Compute the IoU between the current bbox and all the other bboxes
     intersection = width * height
@@ -182,11 +185,11 @@ def non_max_suppression(bboxes, scores, t):
         areas[current] + areas[sorted_idx[:-1]] - intersection)
 
     # Keep only the bboxes with the lower threshold
-    sorted_idx = sorted_idx[jnp.where(ious < t)[0]]
+    sorted_idx = sorted_idx[np.where(ious < t)[0]]
 
   # Return the indexes of the non-suppressed bboxes
-  selected_idx = jnp.array(selected_idx, dtype=jnp.int32)
-  return bboxes[selected_idx, :], selected_idx
+  selected_idx = np.array(selected_idx, dtype=np.int32)
+  return bboxes[selected_idx], selected_idx
 
 
 def vertical_pad(data, pad_count, dtype=jnp.float32):
@@ -204,7 +207,22 @@ def vertical_pad(data, pad_count, dtype=jnp.float32):
   return jnp.append(data, pad_structure, axis=0)
 
 
-def _top_k(scores, k, t=0.0):
+def vertical_pad_np(data, pad_count, dtype=float):
+  """Applies vertical padding to the data by adding extra rows with 0.
+  
+  Args:
+    data: the data to be padded 
+    pad_count: the number of extra rows of padding to be added to the data
+
+  Returns:
+    `data` with extra padding
+  """
+  pad_shape = (pad_count,) + data.shape[1:]
+  pad_structure = np.zeros(pad_shape, dtype=dtype)
+  return np.append(data, pad_structure, axis=0)
+
+
+def top_k(scores, k, t=0.0):
   """Applies top k selection on the `scores` parameter.
 
   Args:
@@ -216,291 +234,400 @@ def _top_k(scores, k, t=0.0):
 
   Returns:
     Top top k entries from `scores` after thresholding with `t` is applied,
-    as well as their indexes in the original vector.
+    as well as their indexes in the original vector. The values are ordered in
+    ascending order.
   """
-  scores = jnp.where(scores >= t, scores, 0.0)
-  idx = jnp.argsort(scores)[-k:]
+  idx = np.argsort(scores)[-k:]
+  top_k_scores = scores[idx]
+  idx = idx[np.where(top_k_scores >= t)[0]]
   return scores[idx], idx
 
 
-top_k = jax.vmap(_top_k, in_axes=(0, None, None))
+def filter_image_annotations(bboxes, scores, k, per_class, t):
+  """This method applies top-k selection + filtering on image data.
 
-
-def filter_by_score(bboxes,
-                    scores,
-                    score_threshold: float = 0.05,
-                    k: int = 1000,
-                    per_class=False):
-  """Apply top-k filtering on the bbox scores.
-
-  More specifically, apply top `k` selection on the bboxes by filtering 
-  out the bboxes which have a score lower than the `score_threshold`. The 
-  filtering can be done either at the per class level or across all classes
-  at the same time, as indicated by `per_class`.
+  The filtering can be applied either at a per class granularity or across
+  all the classes at once.
 
   Args:
-    bboxes: a matrix of the shape (|B|, 4), where |B| is the number of bboxes;
-      each row will store the bbox's 4 coordinates: [x1, y1, x2, y2]   
-    scores: a matrix of the shape (|B|, K), where K is the number of classes;
-      each entry in a row will store the classification confidence of that class
-    score_threshold: bboxes having a confidence score lower than this parameter
-      will be discarded.
-    k: the `k` parameter of the top k selection
-    per_class: a flag which indicates whether the filtering and NMS operations 
-      should be executed on a per class level    
+    bboxes: an array of the form `(A, 4)` where `A` is the number of anchors
+    scores: an array of the form `(A, K)` where `K` is the number of classes
+    k: the number of maximum elements to be selected 
+    per_class: if True does the filtering on a per class level
+    t: the threshold value
 
   Returns:
-    The bboxes retained after the filtering, and the indexes of these bboxes
-    in the original data structure.
+    A tuple consisting of the filtered bboxes, scores, labels, and usable_row 
+    count (since all the other output structures may be padded). If 
+    `per_class=True` the first dimension will be equal to `k * K` and `j` 
+    otherwise. 
   """
+  # The function below is responsible with filtering the image data
+  def _inner(i_scores, i_labels):
+    i_scores, idx = top_k(i_scores, k, t)
+    i_labels = i_labels[idx]
+    i_bboxes = bboxes[idx]
+    return i_bboxes, i_scores, i_labels, i_bboxes.shape[0]
 
-  def _filter(inner_scores, labels):
-    # First apply the top k filtering on the input
-    top_k_scores, top_k_idx = top_k(inner_scores, k, score_threshold)
-    top_k_bboxes = bboxes[top_k_idx, :]
-    top_k_labels = labels[top_k_idx]
-    return top_k_bboxes, top_k_scores, top_k_labels
+  # Create the dimension variables
+  class_count = scores.shape[-1]
+  row_count = k * class_count if per_class else k
 
-  # Apply per class filtering
+  # Create the accumulators
+  usable_rows = 0
+  bbox_acc = np.zeros((row_count, 4))
+  scores_acc = np.zeros(row_count)
+  labels_acc = np.zeros(row_count, dtype=int)
+
   if per_class:
-    row_count = scores.shape[0]
+    # We'll need to keep track of where to add the intermediate results
+    start_idx = 0
 
-    # Create some accumulators
-    bbox_acc = jnp.zeros((0, 4))
-    scores_acc = jnp.zeros(0)
-    label_acc = jnp.zeros(0)
+    # Start processing each class
+    for i in range(class_count):
+      class_scores = scores[:, i]
+      class_labels = np.ones(class_scores.shape[0], dtype=int) * i
+      res = _inner(class_scores, class_labels)
 
-    # Iterate through all the classes, and apply filtering
-    for i in range(scores.shape[1]):
-      current_labels = jnp.ones(row_count, dtype=jnp.int32) * i
-      current_scores = scores[:, i]
-      temp_bboxes, temp_scores, temp_labels = _filter(current_scores,
-                                                      current_labels)
-      bbox_acc = jnp.append(bbox_acc, temp_bboxes, axis=0)
-      scores_acc = jnp.append(scores_acc, temp_scores, axis=0)
-      label_acc = jnp.append(label_acc, temp_labels, axis=0)
+      # Add results to accumulators
+      end_idx = start_idx + res[3]
+      bbox_acc[start_idx:end_idx, :] = res[0]
+      scores_acc[start_idx:end_idx] = res[1]
+      labels_acc[start_idx:end_idx] = res[2]
 
-    return bbox_acc, scores_acc, label_acc
+      # Update the start_idx to point to the next location in the acc
+      start_idx = end_idx
+
+    # Save the number of usable rows
+    usable_rows = start_idx
   else:
-    current_labels = jnp.argmax(scores, axis=1)
-    current_scores = scores[jnp.arange(scores.shape[0]), current_labels]
-    return _filter(current_scores, current_labels)
+    # Get the label for each anchor, based on confidence
+    class_labels = np.argmax(scores, axis=1)
+    class_scores = scores[np.arange(scores.shape[0]), class_labels]
+    res = _inner(class_scores, class_labels)
+
+    # Assign the computed values to the accumulators
+    usable_rows = res[3]
+    bbox_acc[:usable_rows, :] = res[0]
+    scores_acc[:usable_rows] = res[1]
+    labels_acc[:usable_rows] = res[2]
+
+  # Prepare the data structures for return
+  usable_rows = [usable_rows]
+  bbox_acc = np.expand_dims(bbox_acc, axis=0)
+  scores_acc = np.expand_dims(scores_acc, axis=0)
+  labels_acc = np.expand_dims(labels_acc, axis=0)
+
+  return bbox_acc, scores_acc, labels_acc, usable_rows
 
 
-def batch_filter_by_score(bboxes,
-                          scores,
-                          max_rows,
-                          score_threshold: float = 0.05,
-                          k: int = 1000,
-                          per_class=False):
-  """Apply top-k filtering on a batch. 
+def filter_layer_detections(bboxes, scores, k=1000, per_class=False, t=0.05):
+  """Filter the detections obtained at a layer in the FPN.
 
-  For further explanation see `filter_by_score` documentation.
-
-  Args:
-    bboxes: an array of the shape (N, |B|, 4), where N is the batch count and 
-      |B| is the number of bboxes; each row will store the bbox's 4 
-      coordinates: [x1, y1, x2, y2]   
-    scores: a matrix of the shape (N, |B|, K), where K is the number of classes;
-      each entry in a row will store the classification confidence of that class
-    max_rows: a scalar which indicates the number of output rows for each data
-      structure, obtained either through padding or trimming 
-    score_threshold: bboxes having a confidence score lower than this parameter
-      will be discarded.
-    k: the `k` parameter of the top k selection. This value will also be used
-      to pad the outputs if the number of valid bboxes is lower than `k`
-    per_class: a flag which indicates whether the filtering and NMS operations 
-      should be executed on a per class level; if True, then the output will 
-      be padded to the size of `k x scores.shape[-1]`   
-
-  Returns:
-    A tuple containing: the number of true bboxes (i.e. not obtained through
-    padding), the padded bboxes, the padded scores, the padded labels.  
-  """
-
-  def _inner(idx):
-    # Isolate the relevant image data and apply the filtering
-    temp_bboxes = bboxes[idx, ...]
-    temp_scores = scores[idx, ...]
-    temp_bbox, temp_scores, temp_labels = filter_by_score(
-        temp_bboxes, temp_scores, score_threshold, k, per_class)
-
-    # Pad or trim if necessary
-    count = temp_bbox.shape[0]
-    if count < max_rows:
-      delta = max_rows - count
-      temp_bbox = vertical_pad(temp_bbox, delta)
-      temp_scores = vertical_pad(temp_scores, delta)
-      temp_labels = vertical_pad(temp_labels, delta)
-    elif count > max_rows:
-      # Skip the first rows, as those have lower confidence
-      temp_bbox = temp_bbox[-max_rows:, ...]
-      temp_scores = temp_scores[-max_rows:]
-      temp_labels = temp_labels[-max_rows:]
-
-    return count, temp_bbox, temp_scores, temp_labels
-
-  # Create the structures which will store the filtered bboxes
-  batch_size = bboxes.shape[0]
-  counts = np.zeros(batch_size, dtype=int)
-  filtered_bboxes = np.zeros((batch_size, max_rows, 4))
-  filtered_scores = np.zeros((batch_size, max_rows))
-  filtered_labels = np.zeros((batch_size, max_rows), dtype=int)
-
-  # Apply the filtering function on each batch entry
-  # FIXME: Find a way to do this in parallel
-  for idx, pack in enumerate(map(_inner, np.arange(batch_size))):
-    counts[idx], filtered_bboxes[idx], filtered_scores[idx], filtered_labels[
-        idx] = pack
-
-  # Convert to jnp and return
-  counts = jnp.array(counts, dtype=jnp.int32)
-  filtered_bboxes = jnp.array(filtered_bboxes)
-  filtered_scores = jnp.array(filtered_scores)
-  filtered_labels = jnp.array(filtered_labels, dtype=jnp.int32)
-  return counts, filtered_bboxes, filtered_scores, filtered_labels
-
-
-def generate_inferences(bboxes,
-                        scores,
-                        labels,
-                        counts,
-                        nms=True,
-                        classes=-1,
-                        per_class=False,
-                        iou_threshold=0.5,
-                        max_outputs=100):
-  """Generates the batch bbox predictions.
-
-  More specifically, given a dictionary which stores the filtered outputs 
-  of the regression and classification subnets, this function generates the 
-  final predictions for the batch, by concatenating the valid parts of 
-  the outputs together. This method can optionally also apply Non-Maximum 
-  Suppression (NMS) on the input. NMS can be applied at a per-class level 
-  or on all the classes at the same time.  
+  Filtering can either be done at a per class level or on all the classes. 
+  Filtering itself implies, thresholding out detections with confidence lower 
+  than `t`, and selecting the top `k` entries after.
 
   Args:
-    bboxes: an array having the dimensions (N, L, A, 4), where `N` is the batch
-      size, `L` is the number of levels, and `A` is the number of (padded) 
-      anchors; this stores the 4 anchor coordinates.
-    scores: an array having the shape (N, L, A), which stores the score 
-      associated with each anchor
-    labels: an array having the shape (N, L, A), which stores the label 
-      associated with each anchor
-    counts: an array of the shape (N, L), which stores the number of true
-      anchors; this number is useful towards discarding the padded anchors
-    nms: if True, enables the use of NMS
-    classes: the number of classes in the classification task; if `per_class`
-      is True, this argument must also be specified
-    per_class: if True enables NMS on a per-class level
-    max_outputs: a scalar which indicates the maximal number of predicted bboxes
-      generated by this method. If there are fewer than predictions, then the
-      outputs will be padded. 
+    bboxes: an array of the form `(N, A, 4)` where `N` is the batch size 
+      and `A` is the number of anchors
+    scores: an array of the form `(N, A, K)` where `K` is the number of 
+      classes
+    k: the number of maximum elements to be selected 
+    per_class: if True does the filtering on a per class level
+    t: the threshold value
 
   Returns:
-    A dictionary of the following form:
-
-    ```
-    {
-      "counts": <count_list>,  # Shape: (<batch_size>)
-      "bboxes": <bboxes>,  # Shape: (<batch_size, max_outputs, 4>)
-      "scores": <scores>,  # Shape: (<batch_size, max_outputs>)
-      "labels": <labels>   # Shape: (<batch_size, max_outputs>)
-    }
-    ```
-
-    Here, `counts` holds the number of usable elements, as the output will be 
-    automatically padded or trimmed to `max_outputs`
+    A tuple consisting of the filtered bboxes, scores, labels, and usable_row 
+    counts. Note that if `per_class=True`, then the output shape across 
+    the 2nd dimension is `k * K`. Otherwise, it is just `k`.
   """
-  assert not per_class or per_class and classes > 0, "If per_class is True, " \
-    "then classes must be a positive integer"
+  batch_size = scores.shape[0]
 
-  def _inner(idx):
-    # Isolate the relevant image data
-    t_bboxes = bboxes[idx, ...]
-    t_scores = scores[idx, ...]
-    t_labels = labels[idx, ...]
-    t_counts = counts[idx]
+  # Leverage multiple cores to do the filtering
+  args = [(bboxes[i], scores[i], k, per_class, t) for i in range(batch_size)]
+  with Pool(processes=batch_size) as pool:
+    res = pool.starmap(filter_image_annotations, args)
 
-    # Prepare the accumulators
-    acc_bboxes = jnp.zeros((0, 4))
-    acc_scores = jnp.zeros(0)
-    acc_labels = jnp.zeros(0, dtype=jnp.int32)
+  # Construct the batch results
+  return_tuple = ()
+  for i in range(4):
+    # Special case when we're collecting the usable_rows
+    if i == 3:
+      acc = []
+      for j in range(batch_size):
+        acc += res[j][i]
+      acc = np.array(acc)
+    else:
+      acc = res[0][i]
+      for j in range(1, batch_size):
+        acc = np.append(acc, res[j][i], axis=0)
 
-    # Concatenate the image data into one
-    levels = t_bboxes.shape[0]
-    for i in range(levels):
-      count = t_counts[i]
-      acc_bboxes = jnp.append(acc_bboxes, t_bboxes[i, :count, :], axis=0)
-      acc_scores = jnp.append(acc_scores, t_scores[i, :count], axis=0)
-      acc_labels = jnp.append(acc_labels, t_labels[i, :count], axis=0)
+    # Concatenate to return tuple
+    return_tuple = return_tuple + (acc,)
 
-    # Apply NMS if requested
-    if nms:
-      if per_class:
-        # Create new acc datastructures
-        t_acc_bboxes = jnp.zeros((0, 4))
-        t_acc_scores = jnp.zeros(0)
-        t_acc_labels = jnp.zeros(0, dtype=jnp.int32)
+  # Return the batch filtered layer
+  return return_tuple
 
-        # Apply NMS for each label
-        for i in range(classes):
-          # Isolate the label data
-          idx = jnp.where(acc_labels == i)[0]
-          t_bboxes = acc_bboxes[idx]
-          t_scores = acc_scores[idx]
-          t_labels = acc_labels[idx]
 
-          # Apply NMS and isolate the data of the top bboxes
-          t_bboxes, nms_idx = non_max_suppression(t_bboxes, t_scores,
+def nms_image(bboxes, scores, labels, usable_rows, t, max_detections, per_class,
+              classes):
+  """This method applies Non-Maximum Suppresion on bboxes.
+
+  The filtering can be applied either at a per class granularity or across
+  all the classes at once.
+
+  Args:
+    bboxes: an array of the form `(A, 4)` where `A` is the number of anchors
+    scores: a vector of length `A` storing the confidence of the bbox
+    labels: a vector of length `A` storing the label of the bbox
+    usable_rows: number of rows in the data structures which are not padding
+    t: the NMS IoU threshold value
+    max_detections: the number of bboxes to be selected 
+    per_class: if True applies NMS on a per class level
+    classes: the number of classes object detection task
+
+  Returns:
+    A tuple consisting of the filtered bboxes, scores, labels, and usable_row 
+    count (since all the other output structures may be padded). The output
+    will always have `max_detections` rows.
+  """
+  # Remove the padding
+  bboxes = bboxes[:usable_rows]
+  scores = scores[:usable_rows]
+  labels = labels[:usable_rows]
+
+  if per_class:
+    # Create the accumulators
+    bbox_acc = np.zeros((0, 4))
+    scores_acc = np.zeros(0)
+    labels_acc = np.zeros(0)
+
+    # Apply NMS per class
+    for i in range(classes):
+      idx = np.where(labels == i)[0]
+
+      # Check that there are entries for this class
+      if idx.shape[0] != 0:
+        bboxes_t = bboxes[idx]
+        scores_t = scores[idx]
+        labels_t = labels[idx]
+
+        bboxes_t, idx = non_max_suppression(bboxes_t, scores_t, t)
+
+        bbox_acc = np.append(bbox_acc, bboxes_t, axis=0)
+        scores_acc = np.append(scores_acc, scores_t[idx], axis=0)
+        labels_acc = np.append(labels_acc, labels_t[idx], axis=0)
+
+    # Top k needs to be applied to the bboxes, in order to choose the best
+    _, idx = top_k(scores_acc, max_detections)
+    idx = np.flip(idx)  # Sort in descending order for the later selection
+    scores = scores_acc[idx]
+    bboxes = bbox_acc[idx]
+    labels = labels_acc[idx]
+  else:
+    # Apply NMS across all the classes
+    bboxes, idx = non_max_suppression(bboxes, scores, t)
+    scores = scores[idx]
+    labels = labels[idx]
+
+  # Either pad or remove excess entries
+  detection_count = bboxes.shape[0]
+  if detection_count >= max_detections:
+    usable_rows = max_detections
+    bboxes = bboxes[:max_detections]
+    scores = scores[:max_detections]
+    labels = labels[:max_detections]
+  elif detection_count < max_detections:
+    usable_rows = detection_count
+    pad_count = max_detections - usable_rows
+    bboxes = vertical_pad_np(bboxes, pad_count)
+    scores = vertical_pad_np(scores, pad_count)
+    labels = vertical_pad_np(labels, pad_count, dtype=int)
+
+  # Prepare the data structures for return
+  usable_rows = [usable_rows]
+  bboxes = np.expand_dims(bboxes, axis=0)
+  scores = np.expand_dims(scores, axis=0)
+  labels = np.expand_dims(labels, axis=0)
+
+  return bboxes, scores, labels, usable_rows
+
+
+def nms_batch(bboxes,
+              scores,
+              labels,
+              usable_rows,
+              classes,
+              max_detections=100,
+              per_class=False,
+              t=0.5):
+  """Filter the detections obtained at a layer in the FPN.
+
+  Filtering can either be done at a per class level or on all the classes. 
+  Filtering itself implies, thresholding out detections with confidence lower 
+  than `t`, and selecting the top `k` entries after.
+
+  Args:
+    bboxes: an array of the form `(N, A, 4)` where `N` is the batch size 
+      and `A` is the number of anchors
+    scores: an array of the form `(N, A)` storing the confidence in each anchor
+    labels: an array of the form `(N, A)` storing the label of each anchor
+    usable_rows: a vector of length `N` storing the number of non-padded rows
+      for each image
+    classes: the number of classes in the object detection task
+    max_detections: the number of maximum detections to be extracted
+    per_class: if True applies NMS on a per class level
+    t: the NMS IoU threshold value
+
+  Returns:
+    A tuple consisting of the filtered bboxes, scores, labels, and usable_row 
+    counts. The output shape across the 2nd dimension is `max_detections`.
+  """
+  batch_size = scores.shape[0]
+
+  # Leverage multiple cores to do the filtering
+  args = [(bboxes[i], scores[i], labels[i], usable_rows[i], t, max_detections,
+           per_class, classes) for i in range(batch_size)]
+  with Pool(processes=batch_size) as pool:
+    res = pool.starmap(nms_image, args)
+
+  # Construct the batch results
+  return_tuple = ()
+  for i in range(4):
+    # Special case when we're collecting the usable_rows
+    if i == 3:
+      acc = []
+      for j in range(batch_size):
+        acc += res[j][i]
+      acc = np.array(acc)
+    else:
+      acc = res[0][i]
+      for j in range(1, batch_size):
+        acc = np.append(acc, res[j][i], axis=0)
+
+    # Concatenate to return tuple
+    return_tuple = return_tuple + (acc,)
+
+  # Return the batch filtered layer
+  return return_tuple
+
+
+def concat_list_element(lst, idx, usable_rows_idx, img_idx):
+  # Create an accumulator with the same shape, but no batch size
+  target_size = 0
+  acc = np.zeros(lst[0][idx].shape[1:])
+
+  # Concatenate the individual levels together
+  for entry in lst:
+    usable_rows = entry[usable_rows_idx][img_idx]
+    data = entry[idx][img_idx, :usable_rows, ...]
+    acc = np.append(acc, data, axis=0)
+
+    # Add to the target_size, so as to know the padding
+    target_size += entry[idx].shape[1]
+
+  # Pad the data, if need be
+  usable_rows = acc.shape[0]
+  if usable_rows < target_size:
+    pad_count = target_size - usable_rows
+    acc = vertical_pad_np(acc, pad_count)
+
+  # Expand the first dimension to allow for stacking later on
+  return np.expand_dims(acc, axis=0), usable_rows
+
+
+def concat_list_batch(lst, idx, usable_rows_idx, batch_size):
+  args = [(lst, idx, usable_rows_idx, i) for i in range(batch_size)]
+  with Pool(processes=batch_size) as pool:
+    res = pool.starmap(concat_list_element, args)
+
+  return np.concatenate([x[0] for x in res], axis=0), [x[1] for x in res]
+
+
+def process_inferences(inference_dict,
+                       per_level=True,
+                       per_class=False,
+                       level_detections=1000,
+                       max_detections=100,
+                       confidence_threshold=0.05,
+                       iou_threshold=0.5):
+  """Processes the inferences produced by a model.
+
+  The processing refers to top-k selection, and NMS. It can be done on a per
+  FPN level granularity (i.e. top-k and confidence thresholding is done for
+  each feature map produced by a classification subnet) if desired. Moreover,
+  top-k and NMS can also be applied at a per class granularity. 
+
+  Args:
+    inference_dict: a dictionary containing the output of the model in inference
+      mode; the dict should have the following structure:
+
+      ```
+      {
+        <layer_name>: (regressed_anchors, anchor_scores),
+        ...
+      }
+      ```
+    per_level: if True, does top-k and thresholding at a per level granularity;
+      otherwise it applies the aforementioned operations on all `inference_dict`
+      entries at once
+    per_class: if True, applies top-k, thresholding and NMS on a per class 
+      level; otherwise, these operations are applied for all classes colectively 
+    level_detections: the number of detections to be selected during top-k and
+      thresholding
+    max_detections: the number of detections to be generated by NMS; note that
+      unlike other options, `max_detections` does not depend on `per_class`,
+      and will produce the same amount of outputs regardless of flag 
+      configurations  
+    confidence_threshold: the threshold used in confidence thresholding; anchors
+      with a confidence score lower than this value are discarded
+    iou_threshold: the threshold used in NMS; IoUs above this value are 
+      discarded
+
+  Returns:
+    A tuple consisting of the filtered bboxes, scores, labels, and usable_row 
+    counts. The output shape across the 2nd dimension is `max_detections`.
+  """
+  # Initialize the variables relevant for this process
+  shape = inference_dict[list(inference_dict.keys())[0]][1].shape
+  batch_size = shape[0]
+  class_count = shape[-1]
+
+  # Do the top-k and thresholding
+  if per_level:
+    # ThreadPools are used, since nested daemonic processes are disallowed  
+    # Apply for each level in the FPN
+    args = [(item[0], item[1], level_detections, per_class,
+             confidence_threshold) for item in inference_dict.values()]
+    with ThreadPool(processes=len(inference_dict)) as pool:
+      res = pool.starmap(filter_layer_detections, args)
+
+    # res is a list of (bboxes, scores, labels, usable_rows); concat first 3
+    args = [(res, i, 3, batch_size) for i in range(3)]
+    with ThreadPool(processes=3) as pool:
+      res = pool.starmap(concat_list_batch, args)
+
+    # Unpack the elements of res
+    bboxes = res[0][0]
+    scores = res[1][0]
+    labels = res[2][0]
+    usable_rows = res[2][1]
+
+  else:
+    # Re-structure the level results, such that they can be concatenated
+    bboxes = np.concatenate([x[0] for x in inference_dict.values()], axis=1)
+    scores = np.concatenate([x[1] for x in inference_dict.values()], axis=1)
+
+    # Apply top-k and thresholding once
+    bboxes, scores, labels, usable_rows = filter_layer_detections(
+        bboxes, scores, level_detections, per_class, confidence_threshold)
+
+  # Apply NMS
+  bboxes, scores, labels, usable_rows = nms_batch(bboxes, scores, labels,
+                                                  usable_rows, class_count,
+                                                  max_detections, per_class,
                                                   iou_threshold)
-          t_scores = t_scores[nms_idx]
-          t_labels = t_labels[nms_idx]
 
-          # Append the filtered bboxes
-          t_acc_bboxes = jnp.append(t_acc_bboxes, t_bboxes, axis=0)
-          t_acc_scores = jnp.append(t_acc_scores, t_scores, axis=0)
-          t_acc_labels = jnp.append(t_acc_labels, t_labels, axis=0)
-
-        # Apply top-k selection based on confidence
-        acc_scores, idx = top_k(t_acc_scores, max_outputs)
-        acc_bboxes = t_acc_bboxes[idx]
-        acc_labels = t_acc_labels[idx]
-      else:
-        acc_bboxes, nms_idx = non_max_suppression(acc_bboxes, acc_scores,
-                                                  iou_threshold)
-        acc_scores = acc_scores[nms_idx]
-        acc_labels = acc_labels[nms_idx]
-
-    # Pad or trim the outputs such that they have `max_outputs` rows
-    count = acc_bboxes.shape[0]
-    if count < max_outputs:
-      delta = max_outputs - count
-      acc_bboxes = vertical_pad(acc_bboxes, delta)
-      acc_scores = vertical_pad(acc_scores, delta)
-      acc_labels = vertical_pad(acc_labels, delta)
-    elif count > max_outputs:
-      acc_bboxes = acc_bboxes[:max_outputs, ...]
-      acc_scores = acc_scores[:max_outputs]
-      acc_labels = acc_labels[:max_outputs]
-
-    # Return the results of this stage
-    return count, acc_bboxes, acc_scores, acc_labels
-
-  # Determine the batch size and initialize accumulator datastructures
-  batch_size = bboxes.shape[0]
-  f_counts = np.zeros(batch_size, dtype=int)
-  f_bboxes = np.zeros((batch_size, max_outputs, 4))
-  f_scores = np.zeros((batch_size, max_outputs))
-  f_labels = np.zeros((batch_size, max_outputs), dtype=int)
-
-  for idx, pack in enumerate(map(_inner, np.arange(batch_size))):
-    f_counts[idx], f_bboxes[idx], f_scores[idx], f_labels[idx] = pack
-
-  # Return the filtered structures
-  return {
-      "counts": jnp.array(f_counts, dtype=jnp.int32),
-      "bboxes": jnp.array(f_bboxes),
-      "scores": jnp.array(f_scores),
-      "labels": jnp.array(f_labels, dtype=jnp.int32)
-  }
+  # Return the results, and ensure that labels is of int type
+  return bboxes, scores, labels.astype(int), usable_rows

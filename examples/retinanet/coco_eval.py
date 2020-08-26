@@ -113,7 +113,6 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
   def __init__(self,
                annotations_loc,
                remove_background=True,
-               threshold=0.05,
                disable_output=True):
     """Initializes a CocoEvaluator object.
 
@@ -123,14 +122,11 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
         download the relevant files from https://cocodataset.org/#download
       remove_background: if True removes the anchors classified as background,
         i.e. having the greatest confidence on label 0
-      threshold: a scalar which indicates the lower threshold (inclusive) for 
-        the scores. Anything below this value will be removed.
       disable_output: if True disables the output produced by the COCO API
 
     """
     self.annotations = []
     self.annotated_img_ids = []
-    self.threshold = threshold
     self.disable_output = disable_output
     self.remove_background = remove_background
     self.coco = COCO(annotations_loc)
@@ -171,7 +167,7 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
     self.annotations.clear()
     self.annotated_img_ids.clear()
 
-  def extract_classifications(self, bboxes, scores):
+  def extract_classifications(self, bboxes, scores, labels, usable_rows, scale):
     """Extracts the label for each bbox, and sorts the results by score.
 
     More specifically, after extracting each bbox's label, the bboxes and 
@@ -179,19 +175,24 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
     below `threshold` are removed.
 
     Args:
-      bboxes: a matrix of the shape (|B|, 4), where |B| is the number of 
+      bboxes: a matrix of the shape (A, 4), where A is the number of 
         bboxes; each row contains the `[x1, y1, x2, y2]` of the bbox
-      scores: a matrix of the shape (|B|, K), where `K` is the number of 
+      scores: a matrix of the shape (A, K), where `K` is the number of 
         classes in the object detection task
+      labels: an array of length `A`, which stores the labels of each anchor
+      usable_rows: a scalar indicating how many rows are not padding 
+      scale: the scale to be applied on the bboxes
 
     Returns:
-      A tuple consisting of the bboxes, a vector of length |B| containing 
-      the label of each of the anchors, and a vector of length |B| containing 
+      A tuple consisting of the bboxes, a vector of length A containing 
+      the label of each of the anchors, and a vector of length A containing 
       the label score. All elements are sorted in descending order relative
       to the score.  
     """
-    # Extract the labels and max score for each anchor
-    labels = np.argmax(scores, axis=1)
+    # Eliminate the padding
+    bboxes = bboxes[:usable_rows] 
+    scores = scores[:usable_rows]
+    labels = labels[:usable_rows]
 
     # If requested, remove the anchors classified as background
     if self.remove_background:
@@ -200,15 +201,13 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
       bboxes = bboxes[kept_idx]
       scores = scores[kept_idx]
 
-    # Get the score associated to each anchor's label
-    scores = scores[np.arange(labels.shape[0]), labels]
+    # Rescale bboxes to original size
+    bboxes = bboxes / scale
 
-    # Apply the threshold
-    kept_idx = np.where(scores >= self.threshold)[0]
-    scores = scores[kept_idx]
-    labels = labels[kept_idx]
-    bboxes = bboxes[kept_idx]
-
+    # Adjust bboxes to COCO standard: [x1, y1, w, h]
+    bboxes[:, 2] -= bboxes[:, 0]
+    bboxes[:, 3] -= bboxes[:, 1]
+    
     # Sort everything in descending order and return
     sorted_idx = np.flip(np.argsort(scores, axis=0))
     scores = scores[sorted_idx]
@@ -217,17 +216,17 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
 
     return bboxes, labels, scores
 
-  def add_annotations(self, bboxes, scores, img_ids, scales):
+  def add_annotations(self, bboxes, scores, labels, usable_rows, img_ids, scales):
     """Add a batch of inferences as COCO annotations for later evaluation
 
-    Note that this method may raise an exception if the `threshold` is too
-    high and thus eliminates all detections.
-
     Args:
-      bboxes: an array of the form (N, |B|, 4), where `N` is the batch size
-        |B| is the number of bboxes containing the bboxes information
-      scores: an array of the form (N, |B|, K), where `K` is the number of 
-        classes. This array contains the confidence scores for each anchor
+      bboxes: an array of the form (N, A, 4), where `N` is the batch size
+        `A` is the number of bboxes containing the bboxes information
+      scores: an array of the form (N, A) which contains the confidence 
+        scores for each anchor
+      labels: an array of the shape (N, A), which stores the anchor label
+      usable_rows: an array of length `N` indicating how many rows are usable,
+        i.e. non-padded
       img_ids: an array of length `N`, containing the id of each of image
       scales: an array of length `N`, containing the scales of each image
     """
@@ -235,14 +234,7 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
     def _inner(idx):
       # Get the sorted bboxes, labels and scores
       i_bboxes, i_labels, i_scores = self.extract_classifications(
-          bboxes[idx], scores[idx])
-
-      # Rescale bboxes to original size
-      i_bboxes = i_bboxes / scales[idx]
-
-      # Adjust bboxes to COCO standard: [x1, y1, w, h]
-      i_bboxes[:, 2] -= i_bboxes[:, 0]
-      i_bboxes[:, 3] -= i_bboxes[:, 1]
+          bboxes[idx], scores[idx], labels[idx], usable_rows[idx], scales[idx])
 
       # Iterate through the promising predictions, and pack them in json format
       i_img_id = img_ids[idx]
@@ -313,6 +305,10 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
       Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] 
       ```
     """
+    if not self.annotations:
+      raise AttributeError("The annotations list is empty!")
+
+
     # Disable stdout if requested
     if self.disable_output:
       sys.stdout = open(os.devnull, 'w')
