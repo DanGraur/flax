@@ -242,22 +242,18 @@ def top_k(scores, k, t=0.0):
   return scores[idx], idx
 
 
-def filter_image_annotations(args):
+def filter_image_annotations(bboxes, scores, k, per_class, t):
   """This method applies top-k selection + filtering on image data.
 
   The filtering can be applied either at a per class granularity or across
   all the classes at once.
 
-  This method is generally meant to be used in a `multiprocessing.Pool`, however
-  it can be used independently as well.
-
   Args:
-    args: a tuple containing the following:
-      * bboxes: an array of the form `(A, 4)` where `A` is the number of anchors
-      * scores: an array of the form `(A, K)` where `K` is the number of classes
-      * k: the number of maximum elements to be selected 
-      * per_class: if True does the filtering on a per class level
-      * t: the threshold value
+    bboxes: an array of the form `(A, 4)` where `A` is the number of anchors
+    scores: an array of the form `(A, K)` where `K` is the number of classes
+    k: the number of maximum elements to be selected 
+    per_class: if True does the filtering on a per class level
+    t: the threshold value
 
   Returns:
     A tuple consisting of the filtered bboxes, scores, labels, and usable_row 
@@ -265,8 +261,6 @@ def filter_image_annotations(args):
     `per_class=True` the first dimension will be equal to `k * K` and `j` 
     otherwise. 
   """
-  # Unpack the arguments
-  bboxes, scores, k, per_class, t = args
 
   # The function below is responsible with filtering the image data
   def _inner(i_scores, i_labels):
@@ -351,9 +345,9 @@ def filter_layer_detections(bboxes, scores, k=1000, per_class=False, t=0.05):
   batch_size = scores.shape[0]
 
   # Leverage multiple cores to do the filtering
-  pool = Pool(processes=batch_size)
   args = [(bboxes[i], scores[i], k, per_class, t) for i in range(batch_size)]
-  res = pool.map(filter_image_annotations, args)
+  with Pool(processes=batch_size) as pool:
+    res = pool.starmap(filter_image_annotations, args)
 
   # Construct the batch results
   return_tuple = ()
@@ -376,34 +370,28 @@ def filter_layer_detections(bboxes, scores, k=1000, per_class=False, t=0.05):
   return return_tuple
 
 
-def nms_image(args):
+def nms_image(bboxes, scores, labels, usable_rows, t, max_detections, per_class,
+              classes):
   """This method applies Non-Maximum Suppresion on bboxes.
 
   The filtering can be applied either at a per class granularity or across
   all the classes at once.
 
-  This method is generally meant to be used in a `multiprocessing.Pool`, however
-  it can be used independently as well.
-
   Args:
-    args: a tuple containing the following:
-      * bboxes: an array of the form `(A, 4)` where `A` is the number of anchors
-      * scores: a vector of length `A` storing the confidence of the bbox
-      * labels: a vector of length `A` storing the label of the bbox
-      * usable_rows: number of rows in the data structures which are not padding
-      * t: the NMS IoU threshold value
-      * max_detections: the number of bboxes to be selected 
-      * per_class: if True applies NMS on a per class level
-      * classes: the number of classes object detection task
+    bboxes: an array of the form `(A, 4)` where `A` is the number of anchors
+    scores: a vector of length `A` storing the confidence of the bbox
+    labels: a vector of length `A` storing the label of the bbox
+    usable_rows: number of rows in the data structures which are not padding
+    t: the NMS IoU threshold value
+    max_detections: the number of bboxes to be selected 
+    per_class: if True applies NMS on a per class level
+    classes: the number of classes object detection task
 
   Returns:
     A tuple consisting of the filtered bboxes, scores, labels, and usable_row 
     count (since all the other output structures may be padded). The output
     will always have `max_detections` rows.
   """
-  # Unpack the arguments
-  bboxes, scores, labels, usable_rows, t, max_detections, per_class, classes = args
-
   # Remove the padding
   bboxes = bboxes[:usable_rows]
   scores = scores[:usable_rows]
@@ -499,10 +487,10 @@ def nms_batch(bboxes,
   batch_size = scores.shape[0]
 
   # Leverage multiple cores to do the filtering
-  pool = Pool(processes=batch_size)
   args = [(bboxes[i], scores[i], labels[i], usable_rows[i], t, max_detections,
            per_class, classes) for i in range(batch_size)]
-  res = pool.map(nms_image, args)
+  with Pool(processes=batch_size) as pool:
+    res = pool.starmap(nms_image, args)
 
   # Construct the batch results
   return_tuple = ()
@@ -525,9 +513,120 @@ def nms_batch(bboxes,
   return return_tuple
 
 
-def process_inferences(inference_dict):
+def concat_list_element(lst, idx, usable_rows_idx, img_idx):
+  # Create an accumulator with the same shape, but no batch size
+  target_size = 0
+  acc = jnp.zeros(entry[0][img_idx].shape[1:])
+
+  # Concatenate the individual levels together
+  for entry in lst:
+    usable_rows = entry[usable_rows_idx][img_idx]
+    data = entry[idx][img_idx, :usable_rows, ...]
+    acc = np.append(acc, data, axis=0)
+
+    # Add to the target_size, so as to know the padding
+    target_size += entry[idx].shape[1]
+
+  # Pad the data, if need be
+  usable_rows = acc.shape[0]
+  if usable_rows < target_size:
+    pad_count = target_size - usable_rows
+    acc = vertical_pad_np(acc, pad_count)
+
+  # Expand the first dimension to allow for stacking later on
+  return np.expand_dims(acc, axis=0), usable_rows
+
+
+def concat_list_batch(lst, idx, usable_rows_idx, batch_size):
+  args = [(lst, idx, usable_rows_idx, i) for i in range(batch_size)]
+  with Pool(processes=batch_size) as pool:
+    res = pool.starmap(filter_layer_detections, args)
+
+  return np.concatenate([x[0] for x in res], axis=0), [x[1] for x in res]
+
+
+def process_inferences(inference_dict,
+                       per_level=True,
+                       per_class=False,
+                       level_detections=1000,
+                       max_detections=100,
+                       confidence_threshold=0.05,
+                       iou_threshold=0.5):
   """Processes the inferences produced by a model.
 
-  The processing refers to top-k selection, and NMS.
+  The processing refers to top-k selection, and NMS. It can be done on a per
+  FPN level granularity (i.e. top-k and confidence thresholding is done for
+  each feature map produced by a classification subnet) if desired. Moreover,
+  top-k and NMS can also be applied at a per class granularity. 
 
+  Args:
+    inference_dict: a dictionary containing the output of the model in inference
+      mode; the dict should have the following structure:
+
+      ```
+      {
+        <layer_name>: (regressed_anchors, anchor_scores),
+        ...
+      }
+      ```
+    per_level: if True, does top-k and thresholding at a per level granularity;
+      otherwise it applies the aforementioned operations on all `inference_dict`
+      entries at once
+    per_class: if True, applies top-k, thresholding and NMS on a per class 
+      level; otherwise, these operations are applied for all classes colectively 
+    level_detections: the number of detections to be selected during top-k and
+      thresholding
+    max_detections: the number of detections to be generated by NMS; note that
+      unlike other options, `max_detections` does not depend on `per_class`,
+      and will produce the same amount of outputs regardless of flag 
+      configurations  
+    confidence_threshold: the threshold used in confidence thresholding; anchors
+      with a confidence score lower than this value are discarded
+    iou_threshold: the threshold used in NMS; IoUs above this value are 
+      discarded
+
+  Returns:
+    A tuple consisting of the filtered bboxes, scores, labels, and usable_row 
+    counts. The output shape across the 2nd dimension is `max_detections`.
   """
+  # Initialize the variables relevant for this process
+  shape = inference_dict[list(inference_dict.keys())[0]][1].shape
+  batch_size = shape[0]
+  class_count = shape[-1]
+
+  # Do the top-k and thresholding
+  if per_level:
+    # Apply for each level in the FPN
+    args = [(item[0], item[1], level_detections, per_class,
+             confidence_threshold) for item in inference_dict.values()]
+    with Pool(processes=len(inference_dict)) as pool:
+      res = pool.starmap(filter_layer_detections, args)
+
+    # res is a list of (bboxes, scores, labels, usable_rows); concat first 3
+    args = [(res, i, 3, batch_size) for i in range(3)]
+    with Pool(processes=len(3)) as pool:
+      res = pool.starmap(concat_list_batch, args)
+
+    # Unpack the elements of res
+    bboxes = res[0][0]
+    scores = res[1][0]
+    labels = res[2][0]
+    usable_rows = res[2][1]
+
+  else:
+    # Re-structure the level results, such that they can be concatenated
+    bboxes = np.concatenate([x[0] for x in inference_dict.values()],
+                            axis=1)
+    scores = np.concatenate([x[1] for x in inference_dict.values()], axis=1)
+
+    # Apply top-k and thresholding once
+    bboxes, scores, labels, usable_rows = filter_layer_detections(
+        bboxes, scores, level_detections, per_class, confidence_threshold)
+
+  # Apply NMS
+  bboxes, scores, labels, usable_rows = nms_batch(bboxes, scores, labels,
+                                                  usable_rows, class_count,
+                                                  max_detections, per_class,
+                                                  iou_threshold)
+
+  return bboxes, scores, labels.astype(int), usable_rows
