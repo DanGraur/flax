@@ -2,6 +2,7 @@ from jax import numpy as jnp
 
 import jax
 from multiprocessing import Pool
+from multiprocessing.pool import ThreadPool
 import numpy as np
 import tensorflow as tf
 
@@ -516,7 +517,7 @@ def nms_batch(bboxes,
 def concat_list_element(lst, idx, usable_rows_idx, img_idx):
   # Create an accumulator with the same shape, but no batch size
   target_size = 0
-  acc = jnp.zeros(entry[0][img_idx].shape[1:])
+  acc = np.zeros(lst[0][idx].shape[1:])
 
   # Concatenate the individual levels together
   for entry in lst:
@@ -540,7 +541,7 @@ def concat_list_element(lst, idx, usable_rows_idx, img_idx):
 def concat_list_batch(lst, idx, usable_rows_idx, batch_size):
   args = [(lst, idx, usable_rows_idx, i) for i in range(batch_size)]
   with Pool(processes=batch_size) as pool:
-    res = pool.starmap(filter_layer_detections, args)
+    res = pool.starmap(concat_list_element, args)
 
   return np.concatenate([x[0] for x in res], axis=0), [x[1] for x in res]
 
@@ -596,15 +597,16 @@ def process_inferences(inference_dict,
 
   # Do the top-k and thresholding
   if per_level:
+    # ThreadPools are used, since nested daemonic processes are disallowed  
     # Apply for each level in the FPN
     args = [(item[0], item[1], level_detections, per_class,
              confidence_threshold) for item in inference_dict.values()]
-    with Pool(processes=len(inference_dict)) as pool:
+    with ThreadPool(processes=len(inference_dict)) as pool:
       res = pool.starmap(filter_layer_detections, args)
 
     # res is a list of (bboxes, scores, labels, usable_rows); concat first 3
     args = [(res, i, 3, batch_size) for i in range(3)]
-    with Pool(processes=len(3)) as pool:
+    with ThreadPool(processes=3) as pool:
       res = pool.starmap(concat_list_batch, args)
 
     # Unpack the elements of res
@@ -629,4 +631,5 @@ def process_inferences(inference_dict,
                                                   max_detections, per_class,
                                                   iou_threshold)
 
+  # Return the results, and ensure that labels is of int type
   return bboxes, scores, labels.astype(int), usable_rows
