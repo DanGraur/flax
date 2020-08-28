@@ -262,7 +262,6 @@ def filter_image_annotations(bboxes, scores, k, per_class, t):
     `per_class=True` the first dimension will be equal to `k * K` and `j` 
     otherwise. 
   """
-
   # The function below is responsible with filtering the image data
   def _inner(i_scores, i_labels):
     i_scores, idx = top_k(i_scores, k, t)

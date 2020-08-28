@@ -17,7 +17,16 @@ def get_config():
   config.depth = 50
 
   config.sync_steps = 100
-  config.checkpoint_period = 1_500
+  config.checkpoint_period = 1
+
+  # Inference post processing options
+  config.apply_filtering = False
+  config.per_level = False
+  config.per_class = False
+  config.level_detections = 1000
+  config.max_detections = 100
+  config.confidence_threshold = 0.05
+  config.iou_threshold = 0.5
 
   # Evaluation parameters
   config.eval_annotations_path = "/home/dgraur/data/files/coco_annotations/instances_val2014.json"

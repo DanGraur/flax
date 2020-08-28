@@ -19,6 +19,7 @@ from typing import Any, Iterable, Mapping, Tuple
 
 import input_pipeline
 from model import create_retinanet
+from util import process_inferences
 
 _EPSILON = 1e-9
 
@@ -221,13 +222,7 @@ def coco_eval_step(bboxes, scores, img_ids, scales, evaluator):
     scales: an array of length `N`, containing the scale of each image
     evaluator: a CocoEvaluator object, used to process the inferences
   """
-  # Reshape the data such that it can be processed
-  bboxes_shape = bboxes.shape
-  bboxes = bboxes.reshape(-1, bboxes_shape[-2], bboxes_shape[-1])
-
-  scores_shape = scores.shape
-  scores = scores.reshape(-1, scores_shape[-2], scores_shape[-1])
-
+  # Reshape the scales and image ids
   img_ids = img_ids.reshape(-1)
   scales = scales.reshape(-1)
 
@@ -268,49 +263,76 @@ def sync_results(coco_evaluator):
   return jax.tree_util.build_tree(tree_def, results[0])
 
 
-def infer(data,
-          meta_state,
-          apply_filtering=True,
-          per_level=True,
-          per_class=False,
-          level_detections=1000,
-          max_detections=100,
-          confidence_threshold=0.05,
-          iou_threshold=0.5):
+def infer(data, meta_state):
   """Infers on data.
 
   Args:
     data: the data for inference
     meta_state: an instance of the State class
+
+  Returns:
+    A tuple consisting of the classifications, regressions, and inference_dict
+  """
+  with flax.nn.stateful(meta_state.model_state, mutable=False):
+    pred = meta_state.optimizer.target(
+        data['image'], img_shape=data['size'], train=False)
+  return pred
+
+
+def post_process_inferences(inference_dict,
+                            apply_filtering=True,
+                            per_level=True,
+                            per_class=False,
+                            level_detections=1000,
+                            max_detections=100,
+                            confidence_threshold=0.05,
+                            iou_threshold=0.5):
+  """Post process the results obtained from the model in inference mode
+
+  Args:
+    inference_dict: a dictionary containing the output of the model in inference
+      mode
     apply_filtering: if True, applies thresholding, top-k selection, and NMS;
-      otherwise, concatenates the regressed 
+      otherwise, performs post processing by concatenating the level inferences
+      together and determining the max score and label for each anchor
     per_level: if True, does top-k and thresholding at a per level granularity
     per_class: if True, applies top-k, thresholding and NMS at per class level 
     level_detections: maximum detections during top-k and thresholding
     max_detections: max detections after NMS
     confidence_threshold: the threshold used in confidence thresholding
     iou_threshold: the threshold used in NMS
-
+  
   Returns:
     A tuple consisting of the filtered bboxes, scores, labels and usable rows 
     (i.e. rows which were not obtained through padding).
   """
-  with flax.nn.stateful(meta_state.model_state, mutable=False):
-    pred = meta_state.optimizer.target(
-        data['image'], img_shape=data['size'], train=False)
-
-  # Get the prediction dictionary
-  inference_dict = pred[2]
-
   # If requested, use confidence thresholding, Top-K and Non-Maximum Suppression
   if apply_filtering:
+    # We have to remove the device dimenison to make this work
+    keys = inference_dict.keys()
+    for k in keys:
+      bbox = inference_dict[k][0]
+      scores = inference_dict[k][1]
+
+      # Reshape, cast to numpy and update the dict entry
+      bbox = np.array(bbox.reshape(-1, bbox.shape[-2], bbox.shape[-1]))
+      scores = np.array(scores.reshape(-1, scores.shape[-2], scores.shape[-1]))
+      inference_dict[k] = (bbox, scores)   
+
     return process_inferences(inference_dict, per_level, per_class,
                               level_detections, max_detections,
                               confidence_threshold, iou_threshold)
 
   # Otherwise, concatenate the outputs of the model
-  bboxes = jnp.concatenate([x[0] for x in inference_dict.values()], axis=1)
-  scores = jnp.concatenate([x[1] for x in inference_dict.values()], axis=1)
+  bboxes = jnp.concatenate([x[0] for x in inference_dict.values()], axis=2)
+  scores = jnp.concatenate([x[1] for x in inference_dict.values()], axis=2)
+
+  # Reshape the bboxes and scores to eliminate the device dimensions
+  bboxes_shape = bboxes.shape
+  bboxes = bboxes.reshape(-1, bboxes_shape[-2], bboxes_shape[-1])
+
+  scores_shape = scores.shape
+  scores = scores.reshape(-1, scores_shape[-2], scores_shape[-1])
 
   # Get the shapes for later reconstruction
   batch_size = scores.shape[0]
@@ -506,7 +528,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   # Prepare the training loop for distributed runs
   step_fn = create_step_fn(learning_rate_fn)
   p_step_fn = jax.pmap(step_fn, axis_name="batch")
-  p_infer_fn = jax.pmap(infer, axis_name="batch")  # TODO: Move the inference logic to another method, which is not located in a jitted function.
+  p_infer_fn = jax.pmap(infer, axis_name="batch")
 
   # Note that the CocoEvaluator is a singleton object
   coco_evaluator = CocoEvaluator(config.eval_annotations_path,
@@ -548,10 +570,16 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
       coco_evaluator.clear_annotations()  # Clear former annotations
       val_iter = iter(val_data)  # Refresh the eval iterator
       for _ in range(250):
-        batch = jax.tree_map(lambda x: x._numpy(),q next(val_iter))  # pylint: disable=protected-access
-        scores, regressions, bboxes = p_infer_fn(batch, meta_state)
-        coco_eval_step(bboxes, scores, batch["id"], batch["scale"],
-                       coco_evaluator)
+        batch = jax.tree_map(lambda x: x._numpy(), next(val_iter))  # pylint: disable=protected-access
+        scores, regressions, inference_dict = p_infer_fn(batch, meta_state)
+        print("BEFORE post_process_inferences")
+        bboxes, scores, labels, usable_rows = post_process_inferences(
+            inference_dict, config.apply_filtering, config.per_level,
+            config.per_class, config.level_detections, config.max_detections,
+            config.confidence_threshold, config.iou_threshold)
+        print("AFTER post_process_inferences")
+        # coco_eval_step(bboxes, scores, labels, usable_rows, batch["id"], 
+        #                batch["scale"], coco_evaluator)
 
       # Compute the COCO metrics
       eval_results = coco_evaluator.compute_coco_metrics()
