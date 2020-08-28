@@ -617,8 +617,7 @@ def process_inferences(inference_dict,
 
   else:
     # Re-structure the level results, such that they can be concatenated
-    bboxes = np.concatenate([x[0] for x in inference_dict.values()],
-                            axis=1)
+    bboxes = np.concatenate([x[0] for x in inference_dict.values()], axis=1)
     scores = np.concatenate([x[1] for x in inference_dict.values()], axis=1)
 
     # Apply top-k and thresholding once

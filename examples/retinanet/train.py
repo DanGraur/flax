@@ -83,10 +83,11 @@ def create_scheduled_decay_fn(learning_rate: float,
   return decay_fn
 
 
-def create_model(rng: jnp.ndarray,
-                 depth: int = 50,
-                 classes: int = 1000,
-                 shape: Iterable[int] = (224, 224, 3)) -> flax.nn.Model:
+def create_model(
+    rng: jnp.ndarray,
+    depth: int = 50,
+    classes: int = 1000,
+    shape: Iterable[int] = (224, 224, 3)) -> flax.nn.Model:
   """Creates a RetinaNet model.
 
   Args:
@@ -256,32 +257,76 @@ def sync_results(coco_evaluator):
     i_ids = jax.lax.all_gather(ids, 'batch')
 
     return i_annotations, i_ids
-  inner = jax.pmap(_inner, 'batch')
 
+  inner = jax.pmap(_inner, 'batch')
 
   # Compute the results this is host 0
   inner()
   if jax.host_id() == 0:
-    coco_evaluator.set_annotations_and_ids(annotations, ids) 
+    coco_evaluator.set_annotations_and_ids(annotations, ids)
 
   return jax.tree_util.build_tree(tree_def, results[0])
 
 
-def infer(data, meta_state):
+def infer(data,
+          meta_state,
+          apply_filtering=True,
+          per_level=True,
+          per_class=False,
+          level_detections=1000,
+          max_detections=100,
+          confidence_threshold=0.05,
+          iou_threshold=0.5):
   """Infers on data.
 
   Args:
     data: the data for inference
-    model: an instance of the State class
+    meta_state: an instance of the State class
+    apply_filtering: if True, applies thresholding, top-k selection, and NMS;
+      otherwise, concatenates the regressed 
+    per_level: if True, does top-k and thresholding at a per level granularity
+    per_class: if True, applies top-k, thresholding and NMS at per class level 
+    level_detections: maximum detections during top-k and thresholding
+    max_detections: max detections after NMS
+    confidence_threshold: the threshold used in confidence thresholding
+    iou_threshold: the threshold used in NMS
 
   Returns:
-    The inference on the data, i.e. the tuple consisting of: classifications, 
-    regressions, bboxes 
+    A tuple consisting of the filtered bboxes, scores, labels and usable rows 
+    (i.e. rows which were not obtained through padding).
   """
   with flax.nn.stateful(meta_state.model_state, mutable=False):
     pred = meta_state.optimizer.target(
         data['image'], img_shape=data['size'], train=False)
-  return pred
+
+  # Get the prediction dictionary
+  inference_dict = pred[2]
+
+  # If requested, use confidence thresholding, Top-K and Non-Maximum Suppression
+  if apply_filtering:
+    return process_inferences(inference_dict, per_level, per_class,
+                              level_detections, max_detections,
+                              confidence_threshold, iou_threshold)
+
+  # Otherwise, concatenate the outputs of the model
+  bboxes = jnp.concatenate([x[0] for x in inference_dict.values()], axis=1)
+  scores = jnp.concatenate([x[1] for x in inference_dict.values()], axis=1)
+
+  # Get the shapes for later reconstruction
+  batch_size = scores.shape[0]
+  anchor_count = scores.shape[1]
+  class_count = scores.shape[-1]
+
+  # Compute the inferences
+  scores = scores.reshape(-1, class_count)
+  labels = jnp.argmax(scores, axis=1)
+  scores = scores[jnp.arange(scores.shape[0]), labels].reshape(
+      (batch_size, anchor_count))
+  labels = labels.reshape((batch_size, anchor_count))
+  usable_rows = [anchor_count] * batch_size
+
+  # Return the outputs
+  return bboxes, scores, labels, usable_rows
 
 
 def checkpoint_state(meta_state: State, checkpoint_dir: str = "checkpoints"):
@@ -409,7 +454,8 @@ def eval_to_tensorboard(writer, evals, step, train=True, aggregate=True):
   writer.flush()
 
 
-def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str) -> State:
+def train_and_evaluate(config: ml_collections.ConfigDict,
+                       workdir: str) -> State:
   """Runs a training and evaluation loop.
 
   Args:
@@ -438,10 +484,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str) -> State
   rng, model_rng = jax.random.split(rng)
 
   model, model_state = create_model(
-      model_rng,
-      shape=input_shape,
-      classes=num_classes,
-      depth=config.depth)
+      model_rng, shape=input_shape, classes=num_classes, depth=config.depth)
   optimizer = create_optimizer(model, beta=0.9, weight_decay=0.0001)
   meta_state = State(optimizer=optimizer, model_state=model_state)
   del model, model_state, optimizer
@@ -463,7 +506,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str) -> State
   # Prepare the training loop for distributed runs
   step_fn = create_step_fn(learning_rate_fn)
   p_step_fn = jax.pmap(step_fn, axis_name="batch")
-  p_infer_fn = jax.pmap(infer, axis_name="batch")
+  p_infer_fn = jax.pmap(infer, axis_name="batch")  # TODO: Move the inference logic to another method, which is not located in a jitted function.
 
   # Note that the CocoEvaluator is a singleton object
   coco_evaluator = CocoEvaluator(config.eval_annotations_path,
@@ -505,7 +548,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str) -> State
       coco_evaluator.clear_annotations()  # Clear former annotations
       val_iter = iter(val_data)  # Refresh the eval iterator
       for _ in range(250):
-        batch = jax.tree_map(lambda x: x._numpy(), next(val_iter))  # pylint: disable=protected-access
+        batch = jax.tree_map(lambda x: x._numpy(),q next(val_iter))  # pylint: disable=protected-access
         scores, regressions, bboxes = p_infer_fn(batch, meta_state)
         coco_eval_step(bboxes, scores, batch["id"], batch["scale"],
                        coco_evaluator)

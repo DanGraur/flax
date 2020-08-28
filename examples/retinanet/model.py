@@ -326,8 +326,9 @@ class RetinaNet(flax.nn.Module):
         the [H, W, C] of each image.
 
     Returns:
-      A dictionary of the form: feature_map_lvl : int -> (feature_map,
-      classification_output, regression_output)
+      A tuple consisting of: classifications, regressions, and the inference
+      dictionary. Note that the latter entry will only be present if 
+      `train=False`, i.e. if the model is in inference mode.
     """
     assert depth in self.depths, "Architecture depth is not supported."
     assert train or img_shape is not None, "Must provide image sizes for " \
@@ -358,6 +359,9 @@ class RetinaNet(flax.nn.Module):
     regressions = jnp.zeros((data.shape[0], 0, 4))
     classifications = jnp.zeros((data.shape[0], 0, classes))
 
+    # In inference mode, collect each level's output to process later
+    inference_dict = {}
+
     for idx, layer_idx in enumerate(range(3, 8)):
       # Get the feature maps for this subnet
       layer_input = fpn_features["P{}".format(layer_idx)]
@@ -382,9 +386,10 @@ class RetinaNet(flax.nn.Module):
         bboxes_temp = clip_anchors(bboxes_temp, img_shape[:, 0], img_shape[:,
                                                                            1])
         bboxes = jnp.append(bboxes, bboxes_temp, axis=1)
+        inference_dict["P{}".format(layer_idx)] = (bboxes, classifications_temp) 
 
-    # Return the regressions, classifications, and bboxes
-    return classifications, regressions, bboxes
+    # Return the regressions, classifications, and the inference dictionary
+    return classifications, regressions, inference_dict
 
 
 def create_retinanet(depth, **kwargs):
