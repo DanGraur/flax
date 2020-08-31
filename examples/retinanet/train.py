@@ -213,25 +213,28 @@ def retinanet_loss(classifications: jnp.array,
   return jnp.sum(fl + sl1 * reg_weight) / valid_anchors
 
 
-def coco_eval_step(bboxes, scores, img_ids, scales, evaluator):
+def coco_eval_step(bboxes, scores, labels, usable_rows, img_ids, scales,
+                   evaluator):
   """Adds a set of batch inferences to the COCO evaluation object
 
   Args:
-    pred: the output of the model in inference mode
+    bboxes: an array of the shape (N, A, 4), where `N` is the batch size, and
+      `A` is the number of anchors
+    scores: an array of the shape (N, A), which stores the anchor confidence 
+    labels: an array of the shape (N, A), which stores the anchor label
+    usable_rows: an array of length `N` indicating how many rows are usable,
+      i.e. non-padded
     img_ids: an array of length `N`, containing the id of each of image
     scales: an array of length `N`, containing the scale of each image
     evaluator: a CocoEvaluator object, used to process the inferences
   """
-  # Reshape the scales and image ids
-  img_ids = img_ids.reshape(-1)
-  scales = scales.reshape(-1)
-
   # Convert to numpy to avoid incompatibility issues
   bboxes = np.array(bboxes)
   scores = np.array(scores)
 
   # Add the annotations and return the evaluator
-  evaluator.add_annotations(bboxes, scores, img_ids, scales)
+  evaluator.add_annotations(bboxes, scores, labels, usable_rows, img_ids,
+                            scales)
 
 
 def sync_results(coco_evaluator):
@@ -317,7 +320,7 @@ def post_process_inferences(inference_dict,
       # Reshape, cast to numpy and update the dict entry
       bbox = np.array(bbox.reshape(-1, bbox.shape[-2], bbox.shape[-1]))
       scores = np.array(scores.reshape(-1, scores.shape[-2], scores.shape[-1]))
-      inference_dict[k] = (bbox, scores)   
+      inference_dict[k] = (bbox, scores)
 
     return process_inferences(inference_dict, per_level, per_class,
                               level_detections, max_detections,
@@ -532,8 +535,17 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
 
   # Note that the CocoEvaluator is a singleton object
   coco_evaluator = CocoEvaluator(config.eval_annotations_path,
-                                 config.eval_remove_background,
-                                 config.eval_threshold)
+                                 config.eval_remove_background)
+
+  process_inferences_partial_fn = partial(
+      post_process_inferences,
+      apply_filtering=config.apply_filtering,
+      per_level=config.per_level,
+      per_class=config.per_class,
+      level_detections=config.level_detections,
+      max_detections=config.max_detections,
+      confidence_threshold=config.confidence_threshold,
+      iou_threshold=config.iou_threshold)
 
   # Run the training loop
   running_metrics = []
@@ -569,17 +581,15 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
       # Run evaluation on the model
       coco_evaluator.clear_annotations()  # Clear former annotations
       val_iter = iter(val_data)  # Refresh the eval iterator
-      for _ in range(250):
+      for _ in range(20):
         batch = jax.tree_map(lambda x: x._numpy(), next(val_iter))  # pylint: disable=protected-access
         scores, regressions, inference_dict = p_infer_fn(batch, meta_state)
-        print("BEFORE post_process_inferences")
-        bboxes, scores, labels, usable_rows = post_process_inferences(
-            inference_dict, config.apply_filtering, config.per_level,
-            config.per_class, config.level_detections, config.max_detections,
-            config.confidence_threshold, config.iou_threshold)
-        print("AFTER post_process_inferences")
-        # coco_eval_step(bboxes, scores, labels, usable_rows, batch["id"], 
-        #                batch["scale"], coco_evaluator)
+
+        bboxes, scores, labels, usable_rows = process_inferences_partial_fn(
+            inference_dict)
+        coco_eval_step(bboxes, scores, labels, usable_rows,
+                       batch["id"].reshape(-1), batch["scale"].reshape(-1),
+                       coco_evaluator)
 
       # Compute the COCO metrics
       eval_results = coco_evaluator.compute_coco_metrics()
