@@ -1,97 +1,14 @@
-from jax import numpy as jnp
+from typing import Dict, Iterable, Mapping, Tuple
 
+from jax import numpy as jnp
 import jax
 from multiprocessing import Pool
 from multiprocessing.pool import ThreadPool
 import numpy as np
 import tensorflow as tf
 
-CATEGORY_MAP = {
-    0: "background",
-    1: "person",
-    2: "bicycle",
-    3: "car",
-    4: "motorcycle",
-    5: "airplane",
-    6: "bus",
-    7: "train",
-    8: "truck",
-    9: "boat",
-    10: "traffic light",
-    11: "fire hydrant",
-    12: "stop sign",
-    13: "parking meter",
-    14: "bench",
-    15: "bird",
-    16: "cat",
-    17: "dog",
-    18: "horse",
-    19: "sheep",
-    20: "cow",
-    21: "elephant",
-    22: "bear",
-    23: "zebra",
-    24: "giraffe",
-    25: "backpack",
-    26: "umbrella",
-    27: "handbag",
-    28: "tie",
-    29: "suitcase",
-    30: "frisbee",
-    31: "skis",
-    32: "snowboard",
-    33: "sports ball",
-    34: "kite",
-    35: "baseball bat",
-    36: "baseball glove",
-    37: "skateboard",
-    38: "surfboard",
-    39: "tennis racket",
-    40: "bottle",
-    41: "wine glass",
-    42: "cup",
-    43: "fork",
-    44: "knife",
-    45: "spoon",
-    46: "bowl",
-    47: "banana",
-    48: "apple",
-    49: "sandwich",
-    50: "orange",
-    51: "broccoli",
-    52: "carrot",
-    53: "hot dog",
-    54: "pizza",
-    55: "donut",
-    56: "cake",
-    57: "chair",
-    58: "couch",
-    59: "potted plant",
-    60: "bed",
-    61: "dining table",
-    62: "toilet",
-    63: "tv",
-    64: "laptop",
-    65: "mouse",
-    66: "remote",
-    67: "keyboard",
-    68: "cell phone",
-    69: "microwave",
-    70: "oven",
-    71: "toaster",
-    72: "sink",
-    73: "refrigerator",
-    74: "book",
-    75: "clock",
-    76: "vase",
-    77: "scissors",
-    78: "teddy bear",
-    79: "hair drier",
-    80: "toothbrush"
-}
 
-
-def pi_init(pi):
+def pi_init(pi: float):
   """Wrapper to log-based weight initializer function.
 
   This initializer is used for the bias term in the classification subnet, as
@@ -101,7 +18,7 @@ def pi_init(pi):
     pi: the prior probability of detecting an object
 
   Returns:
-    An array for initializing a module's weights / biases
+    A function used for initializing a module's weights / biases
   """
 
   def _inner(key, shape, dtype=jnp.float32):
@@ -110,32 +27,7 @@ def pi_init(pi):
   return _inner
 
 
-@jax.vmap
-def clip_anchors(anchors, height, width):
-  """Clips anchors to height and width of image.
-
-  More specifically, the x coordinates of the base anchors are clipped,
-  such that they are always found in the `[0, width]` interval, and
-  the `y` coordinates are always found in the `[0, height]` interval.
-
-  Args:
-    anchors: a tensor of the shape (|A|, 4) where each row contains 
-      the `[x1, y1, x2, y1]` of that anchor
-    height: the height of the image
-    width: the width of the image
-
-  Returns:
-    A matrix of the form (|A|, 4), which contains the clipped anchors, as well
-    as an extra column which can be used to store the status of the anchor.
-  """
-  x1 = jnp.clip(anchors[:, 0], 0.0, width)
-  y1 = jnp.clip(anchors[:, 1], 0.0, height)
-  x2 = jnp.clip(anchors[:, 2], 0.0, width)
-  y2 = jnp.clip(anchors[:, 3], 0.0, height)
-  return jnp.stack([x1, y1, x2, y2], axis=1)
-
-
-def non_max_suppression(bboxes, scores, t):
+def non_max_suppression(bboxes: jnp.ndarray, scores: jnp.ndarray, t: float):
   """Implements the Non-Maximum Suppression algorithm.
 
   More specifically, this algorithm retains the bboxes based on their scores 
@@ -192,7 +84,9 @@ def non_max_suppression(bboxes, scores, t):
   return bboxes[selected_idx], selected_idx
 
 
-def vertical_pad(data, pad_count, dtype=jnp.float32):
+def vertical_pad(data: jnp.ndarray,
+                 pad_count: int,
+                 dtype=jnp.float32) -> jnp.ndarray:
   """Applies vertical padding to the data by adding extra rows with 0.
   
   Args:
@@ -207,7 +101,7 @@ def vertical_pad(data, pad_count, dtype=jnp.float32):
   return jnp.append(data, pad_structure, axis=0)
 
 
-def vertical_pad_np(data, pad_count, dtype=float):
+def vertical_pad_np(data: np.ndarray, pad_count: int, dtype=float):
   """Applies vertical padding to the data by adding extra rows with 0.
   
   Args:
@@ -222,7 +116,7 @@ def vertical_pad_np(data, pad_count, dtype=float):
   return np.append(data, pad_structure, axis=0)
 
 
-def top_k(scores, k, t=0.0):
+def top_k(scores: jnp.ndarray, k: int, t: float = 0.0):
   """Applies top k selection on the `scores` parameter.
 
   Args:
@@ -243,7 +137,8 @@ def top_k(scores, k, t=0.0):
   return scores[idx], idx
 
 
-def filter_image_annotations(bboxes, scores, k, per_class, t):
+def filter_image_annotations(bboxes: np.ndarray, scores: np.ndarray, k: int,
+                             per_class: bool, t: float):
   """This method applies top-k selection + filtering on image data.
 
   The filtering can be applied either at a per class granularity or across
@@ -262,6 +157,7 @@ def filter_image_annotations(bboxes, scores, k, per_class, t):
     `per_class=True` the first dimension will be equal to `k * K` and `j` 
     otherwise. 
   """
+
   # The function below is responsible with filtering the image data
   def _inner(i_scores, i_labels):
     i_scores, idx = top_k(i_scores, k, t)
@@ -321,7 +217,11 @@ def filter_image_annotations(bboxes, scores, k, per_class, t):
   return bbox_acc, scores_acc, labels_acc, usable_rows
 
 
-def filter_layer_detections(bboxes, scores, k=1000, per_class=False, t=0.05):
+def filter_layer_detections(bboxes: np.ndarray,
+                            scores: np.ndarray,
+                            k: int = 1000,
+                            per_class: bool = False,
+                            t: float = 0.05):
   """Filter the detections obtained at a layer in the FPN.
 
   Filtering can either be done at a per class level or on all the classes. 
@@ -370,8 +270,9 @@ def filter_layer_detections(bboxes, scores, k=1000, per_class=False, t=0.05):
   return return_tuple
 
 
-def nms_image(bboxes, scores, labels, usable_rows, t, max_detections, per_class,
-              classes):
+def nms_image(bboxes: np.ndarray, scores: np.ndarray, labels: np.ndarray,
+              usable_rows: int, t: float, max_detections: int, per_class: bool,
+              classes: int):
   """This method applies Non-Maximum Suppresion on bboxes.
 
   The filtering can be applied either at a per class granularity or across
@@ -454,14 +355,14 @@ def nms_image(bboxes, scores, labels, usable_rows, t, max_detections, per_class,
   return bboxes, scores, labels, usable_rows
 
 
-def nms_batch(bboxes,
-              scores,
-              labels,
-              usable_rows,
-              classes,
-              max_detections=100,
-              per_class=False,
-              t=0.5):
+def nms_batch(bboxes: np.ndarray,
+              scores: np.ndarray,
+              labels: np.ndarray,
+              usable_rows: np.ndarray,
+              classes: int,
+              max_detections: int = 100,
+              per_class: bool = False,
+              t: float = 0.5):
   """Filter the detections obtained at a layer in the FPN.
 
   Filtering can either be done at a per class level or on all the classes. 
@@ -513,7 +414,29 @@ def nms_batch(bboxes,
   return return_tuple
 
 
-def concat_list_element(lst, idx, usable_rows_idx, img_idx):
+def concat_list_element(lst: Iterable, idx: int, usable_rows_idx: int,
+                      img_idx: int) -> np.ndarray:
+  """Given a list of tuples, concatenates the elements at `idx` together.
+
+  More specifically, this method will iterate through `lst`, and concatenate
+  all the elements in each tuple at `idx` together. The elements are expected
+  to be batches, so `img_idx` will indicate which image to access in the batch
+  for concatenation.
+
+  Args:
+    lst: a list which holds tuples of batched arrays, the tuples must also hold
+      a structure which indicates how many rows are usable (non-padded)
+    idx: the index in the tuples at which the elements to be concatenated
+      can be found
+    usable_rows_idx: the index of the structure in the tuple which indicates 
+      how many rows are usable
+    img_idx: the index in the batch, of the image whose data is to be 
+      concatenated together
+    
+  Returns:
+    An array, which stores the concatenated data, with an expanded first
+    dimension for later stacking with the other images.
+  """
   # Create an accumulator with the same shape, but no batch size
   target_size = 0
   acc = np.zeros(lst[0][idx].shape[1:])
@@ -537,7 +460,27 @@ def concat_list_element(lst, idx, usable_rows_idx, img_idx):
   return np.expand_dims(acc, axis=0), usable_rows
 
 
-def concat_list_batch(lst, idx, usable_rows_idx, batch_size):
+def concat_list_batch(lst: Iterable, idx: int, usable_rows_idx: int,
+                      batch_size: int) -> np.ndarray:
+  """Given a list of tuples, concatenates the elements at `idx` together.
+
+  More specifically, this method will iterate through `lst`, and concatenate
+  all the elements in each tuple at `idx` together. The elements are expected
+  to be batches, so the output will also maintain the batch dimension
+
+  Args:
+    lst: a list which holds tuples of batched arrays, the tuples must also hold
+      a structure which indicates how many rows are usable (non-padded)
+    idx: the index in the tuples at which the elements to be concatenated
+      can be found
+    usable_rows_idx: the index of the structure in the tuple which indicates 
+      how many rows are usable
+    batch_size: the number of elements in the batch
+    
+  Returns:
+    An array, which stores the concatenated data, where the first dimension is 
+    equal to the `batch_size`.
+  """
   args = [(lst, idx, usable_rows_idx, i) for i in range(batch_size)]
   with Pool(processes=batch_size) as pool:
     res = pool.starmap(concat_list_element, args)
@@ -545,13 +488,15 @@ def concat_list_batch(lst, idx, usable_rows_idx, batch_size):
   return np.concatenate([x[0] for x in res], axis=0), [x[1] for x in res]
 
 
-def process_inferences(inference_dict,
-                       per_level=True,
-                       per_class=False,
-                       level_detections=1000,
-                       max_detections=100,
-                       confidence_threshold=0.05,
-                       iou_threshold=0.5):
+def process_inferences(
+    inference_dict: Mapping[str, np.ndarray],
+    per_level: bool = True,
+    per_class: bool = False,
+    level_detections: int = 1000,
+    max_detections: int = 100,
+    confidence_threshold: float = 0.05,
+    iou_threshold: float = 0.5
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
   """Processes the inferences produced by a model.
 
   The processing refers to top-k selection, and NMS. It can be done on a per
@@ -596,7 +541,7 @@ def process_inferences(inference_dict,
 
   # Do the top-k and thresholding
   if per_level:
-    # ThreadPools are used, since nested daemonic processes are disallowed  
+    # ThreadPools are used, since nested daemonic processes are disallowed
     # Apply for each level in the FPN
     args = [(item[0], item[1], level_detections, per_class,
              confidence_threshold) for item in inference_dict.values()]
