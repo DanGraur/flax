@@ -3,7 +3,7 @@ import os
 import ml_collections
 
 
-def get_config():
+def get_config() -> ml_collections.ConfigDict:
   """Get the default hyperparameter configuration."""
   config = ml_collections.ConfigDict()
 
