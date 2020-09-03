@@ -553,13 +553,12 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
     if step % config.checkpoint_period == 0 and step != 0:
       # Checkpoint the model
       meta_state = sync_model_state(meta_state)
-      checkpoint_state(meta_state)
+      checkpoint_state(meta_state, checkpoint_dir="final_checkpoints") # FIXME: remove this part
+      continue # FIXME: remove this part
 
       # Run evaluation on the model
       coco_evaluator.clear_annotations()  # Clear former annotations
       for eval_step, batch in enumerate(val_data):
-        if eval_step == 10:
-          break
         batch = jax.tree_map(lambda x: x._numpy(), batch) 
         scores, regressions, inference_dict = p_infer_fn(batch, meta_state)
 

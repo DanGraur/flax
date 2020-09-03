@@ -19,7 +19,7 @@ def get_config() -> ml_collections.ConfigDict:
   config.depth = 50
 
   config.sync_steps = 100
-  config.checkpoint_period = 500
+  config.checkpoint_period = 1000
 
   # Inference post processing options
   config.apply_filtering = True

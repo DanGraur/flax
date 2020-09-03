@@ -32,7 +32,8 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("workdir", f"/tmp/workdir_{int(time.time())}",
                     "Work unit directory.")
 config_flags.DEFINE_config_file(
-    "config", "configs/default.py", "Training configuration.", lock_config=True)
+    "config", "configs/default.py", "Training configuration.", 
+    lock_config=False)
 flags.DEFINE_string(
     "jax_backend_target", None,
     "JAX backend target to use. Set this to grpc://<TPU_IP_ADDRESS>:8740 to " \
