@@ -8,7 +8,9 @@ from ml_collections import config_flags
 import tensorflow as tf
 
 import input_pipeline
-from train import State, create_model, create_optimizer, infer, post_process_inferences, restore_checkpoint
+from configs.default import get_config
+from train import (State, create_model, create_optimizer, infer,
+  post_process_inferences, restore_checkpoint)
 
 # Config TPU.
 try:
@@ -20,8 +22,21 @@ except ImportError:
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("checkpoint_dir", None, "Location of model checkpoint.")
-config_flags.DEFINE_config_file(
-    "config", "configs/default.py", "Training configuration.", lock_config=True)
+flags.DEFINE_integer("seed", 42, "PRNG Seed")
+flags.DEFINE_boolean("postprocessing", True, "If postprocessing should be used")
+flags.DEFINE_boolean("per_level", False,
+                     "If postprocessing should be done per level")
+flags.DEFINE_boolean("per_class", True,
+                     "If postprocessing should be done per class")
+flags.DEFINE_integer(
+    "level_detections", 1000,
+    "The number of detections to be made per level in Top-K and Thresholding")
+flags.DEFINE_integer("max_detections", 100,
+                 "The maximal number of detections after NMS")
+flags.DEFINE_float("confidence_threshold", 0.05,
+                   "The threshold used for thresholding")
+flags.DEFINE_float("iou_threshold", 0.5, "The IoU threshold used during NMS")
+flags.DEFINE_integer("depth", 50, "The depth of the RetinaNet")
 flags.DEFINE_string(
     "jax_backend_target", None,
     "JAX backend target to use. Set this to grpc://<TPU_IP_ADDRESS>:8740 to " \
@@ -30,9 +45,14 @@ flags.DEFINE_string(
 flags.mark_flag_as_required('checkpoint_dir')
 
 
-def produce_inferences(checkpoint_dir, config):
+def produce_inferences(checkpoint_dir, seed, postprocessing, per_level,
+                       per_class, level_detections, max_detections,
+                       confidence_threshold, iou_threshold):
+  # Read the default config file, it will be useful later
+  config = get_config()
+
   # Use the COCO 2014 dataset
-  rng = jax.random.PRNGKey(config.seed)
+  rng = jax.random.PRNGKey(seed)
   rng, data_rng = jax.random.split(rng)
   ds_info, train_data, val_data = input_pipeline.create_datasets(
       config, data_rng)
@@ -42,7 +62,7 @@ def produce_inferences(checkpoint_dir, config):
   # Create a dummy state
   rng, model_rng = jax.random.split(rng)
   model, model_state = create_model(
-      model_rng, shape=input_shape, classes=num_classes, depth=config.depth)
+      model_rng, shape=input_shape, classes=num_classes, depth=depth)
   optimizer = create_optimizer(model, beta=0.9, weight_decay=0.0001)
   state = State(optimizer=optimizer, model_state=model_state)
   del model, model_state, optimizer
@@ -58,13 +78,13 @@ def produce_inferences(checkpoint_dir, config):
   # Create a partial function for processing the inferences
   process_inferences_partial_fn = partial(
       post_process_inferences,
-      apply_filtering=config.apply_filtering,
-      per_level=config.per_level,
-      per_class=config.per_class,
-      level_detections=config.level_detections,
-      max_detections=config.max_detections,
-      confidence_threshold=config.confidence_threshold,
-      iou_threshold=config.iou_threshold)
+      apply_filtering=postprocessing,
+      per_level=per_level,
+      per_class=per_class,
+      level_detections=level_detections,
+      max_detections=cmax_detections,
+      confidence_threshold=cconfidence_threshold,
+      iou_threshold=iou_threshold)
 
   # Yield inferences one by one
   for step, batch in enumerate(train_data):
@@ -86,9 +106,11 @@ def main(argv):
   # Make sure TF does not allocate memory on the GPU.
   tf.config.experimental.set_visible_devices([], "GPU")
 
-  # produce_inferences(FLAGS.checkpoint_dir, FLAGS.config)
-  itr = iter(produce_inferences(FLAGS.checkpoint_dir, FLAGS.config))
-  print(next(itr))
+  itr = iter(
+      produce_inferences(FLAGS.checkpoint_dir, FLAGS.seed, FLAGS.postprocessing,
+                         FLAGS.per_level, FLAGS.per_class,
+                         FLAGS.level_detections, FLAGS.max_detections,
+                         FLAGS.confidence_threshold, FLAGS.iou_threshold))
 
 
 if __name__ == "__main__":
